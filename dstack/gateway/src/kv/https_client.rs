@@ -236,12 +236,9 @@ impl HttpsClient {
             anyhow::bail!("request failed: {}", response.status());
         }
 
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .context("failed to read response body")?
-            .to_bytes();
+        // Bounded like every other response: this is the bootnode GetPeers path, and
+        // the threat model does not assume a bootnode is honest.
+        let body = read_body_bounded(response.into_body()).await?;
 
         serde_json::from_slice(&body).context("failed to parse response")
     }
