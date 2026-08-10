@@ -440,3 +440,178 @@ mod tests {
         assert!(validator.validate(b"not a certificate at all").is_err());
     }
 }
+
+/// Negotiation and response-bounding tested against a real TLS peer.
+///
+/// `post_bytes_probe`'s mapping of 404/405 to `Ok(None)` *is* the v1/v2 protocol
+/// negotiation: a gateway that has not been upgraded has no `/wavekv/sync2` route, and
+/// that status is the only signal its peers get. Every mutation of that condition
+/// survived, because nothing exercised the function at all — it needs a peer that speaks
+/// TLS, and `https_only()` means a plain HTTP stub will not do.
+///
+/// No container and no TEE: a local listener with a certificate minted in process.
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use hyper::service::service_fn;
+    use hyper::{Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    /// A CA plus a leaf valid for 127.0.0.1, written where `HttpsClient::new` expects.
+    fn tls_material(dir: &std::path::Path) -> (HttpsClientConfig, Vec<u8>, Vec<u8>) {
+        use ra_tls::rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params =
+            CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("leaf params");
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .expect("leaf cert");
+
+        let cert_path = dir.join("node.crt");
+        let key_path = dir.join("node.key");
+        let ca_path = dir.join("ca.crt");
+        std::fs::write(&cert_path, leaf_cert.pem()).expect("write cert");
+        std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write key");
+        std::fs::write(&ca_path, ca_cert.pem()).expect("write ca");
+
+        (
+            HttpsClientConfig {
+                cert_path: cert_path.to_string_lossy().into_owned(),
+                key_path: key_path.to_string_lossy().into_owned(),
+                ca_cert_path: ca_path.to_string_lossy().into_owned(),
+                cert_validator: None,
+            },
+            leaf_cert.der().to_vec(),
+            leaf_key.serialize_der(),
+        )
+    }
+
+    /// Serve one fixed response over TLS and return the URL to reach it.
+    async fn serve(status: StatusCode, body: Vec<u8>, cert: Vec<u8>, key: Vec<u8>) -> String {
+        let certs = vec![rustls::pki_types::CertificateDer::from(cert)];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key).expect("server key");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(tls),
+                            service_fn(move |_req| {
+                                let body = body.clone();
+                                async move {
+                                    Ok::<_, Infallible>(
+                                        Response::builder()
+                                            .status(status)
+                                            .body(Full::new(Bytes::from(body)))
+                                            .expect("response"),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        format!("https://127.0.0.1:{}/wavekv/sync2/persistent", addr.port())
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).expect("gzip");
+        encoder.finish().expect("gzip finish")
+    }
+
+    async fn probe(status: StatusCode, body: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, cert, key) = tls_material(dir.path());
+        let url = serve(status, body, cert, key).await;
+        HttpsClient::new(&config)
+            .expect("client")
+            .post_bytes_probe(&url, b"request".to_vec())
+            .await
+    }
+
+    /// A peer still on v1 has no `/wavekv/sync2` route. Both statuses a router can give
+    /// for that must read as "not upgraded", not as a failure — a failure would be
+    /// retried forever instead of falling back to the v1 route.
+    #[tokio::test]
+    async fn a_missing_route_reads_as_not_upgraded() {
+        assert_eq!(
+            probe(StatusCode::NOT_FOUND, Vec::new()).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            probe(StatusCode::METHOD_NOT_ALLOWED, Vec::new())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// ...and any other failure must stay a failure. Reading a 500 as "not upgraded"
+    /// would demote a healthy v2 peer to the v1 path for a whole reprobe window.
+    #[tokio::test]
+    async fn a_server_error_is_not_mistaken_for_a_missing_route() {
+        assert!(probe(StatusCode::INTERNAL_SERVER_ERROR, Vec::new())
+            .await
+            .is_err());
+        assert!(probe(StatusCode::BAD_REQUEST, Vec::new()).await.is_err());
+    }
+
+    /// A peer that answers gets its body decompressed and returned.
+    #[tokio::test]
+    async fn an_upgraded_peer_returns_its_decoded_body() {
+        let payload = b"the-envelope-bytes".to_vec();
+        let got = probe(StatusCode::OK, gzip(&payload)).await.unwrap();
+        assert_eq!(got, Some(payload));
+    }
+
+    /// The response body is bounded before it is decompressed, so a peer cannot spend
+    /// our memory ahead of any decoding limit.
+    ///
+    /// The body must be *valid* gzip that merely exceeds the compressed ceiling. A
+    /// malformed one is rejected by `gunzip_bounded` whatever the ceiling says, so it
+    /// would pass this test with the bound removed entirely — which is exactly what the
+    /// first version of it did. Stored-mode gzip keeps the encoded size at roughly the
+    /// input size, so the payload clears the ceiling while decompressing well inside it.
+    #[tokio::test]
+    async fn an_oversized_response_body_is_refused() {
+        let stored = {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+            encoder
+                .write_all(&vec![0u8; super::super::MAX_COMPRESSED_SYNC_BYTES + 1])
+                .expect("gzip");
+            encoder.finish().expect("gzip finish")
+        };
+        assert!(
+            stored.len() > super::super::MAX_COMPRESSED_SYNC_BYTES,
+            "the fixture depends on the compressed body clearing the ceiling"
+        );
+        assert!(probe(StatusCode::OK, stored).await.is_err());
+    }
+}
