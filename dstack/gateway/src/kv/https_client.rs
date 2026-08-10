@@ -366,3 +366,77 @@ impl CertValidator for AppIdValidator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ra_tls::cert::CertRequest;
+    use ra_tls::rcgen::KeyPair;
+
+    /// A certificate carrying `PHALA_RATLS_APP_ID`, minted in process.
+    ///
+    /// No TEE is involved: `CertRequest` writes the extension unconditionally, and the
+    /// validator below never looks at a quote — it parses DER and compares bytes.
+    fn cert_with_app_id(app_id: &[u8]) -> Vec<u8> {
+        let key = KeyPair::generate().expect("key");
+        CertRequest::builder()
+            .key(&key)
+            .subject("peer.test")
+            .app_id(app_id)
+            .build()
+            .self_signed()
+            .expect("self-signed cert")
+            .der()
+            .to_vec()
+    }
+
+    fn cert_without_app_id() -> Vec<u8> {
+        let key = KeyPair::generate().expect("key");
+        CertRequest::builder()
+            .key(&key)
+            .subject("peer.test")
+            .build()
+            .self_signed()
+            .expect("self-signed cert")
+            .der()
+            .to_vec()
+    }
+
+    /// The client half of the same rule the sync routes enforce on inbound requests.
+    ///
+    /// This runs during the TLS handshake, so a validator that always returns `Ok(())`
+    /// means this gateway will complete a mutually-authenticated connection to any peer
+    /// presenting any certificate our CA signed — and then send it our state. Replacing
+    /// the whole body with `Ok(())`, or inverting the comparison, left the suite green.
+    #[test]
+    fn a_peer_certificate_is_accepted_only_when_its_app_id_matches() {
+        let ours = b"app-id-of-this-cluster".to_vec();
+        let validator = AppIdValidator::new(ours.clone());
+
+        assert_eq!(validator.validate(&cert_with_app_id(&ours)), Ok(()));
+        assert!(
+            validator
+                .validate(&cert_with_app_id(b"a-different-app"))
+                .is_err(),
+            "a certificate from another app must not complete the handshake"
+        );
+    }
+
+    /// A certificate that says nothing about which app holds it proves nothing, and must
+    /// be refused rather than treated as unconstrained.
+    #[test]
+    fn a_peer_certificate_without_an_app_id_is_refused() {
+        let validator = AppIdValidator::new(b"app-id-of-this-cluster".to_vec());
+        let err = validator
+            .validate(&cert_without_app_id())
+            .expect_err("a certificate with no app identity must be refused");
+        assert!(err.contains("app_id"), "{err}");
+    }
+
+    /// Anything that is not a certificate is a parse failure, not a pass.
+    #[test]
+    fn a_malformed_certificate_is_refused() {
+        let validator = AppIdValidator::new(b"whatever".to_vec());
+        assert!(validator.validate(b"not a certificate at all").is_err());
+    }
+}
