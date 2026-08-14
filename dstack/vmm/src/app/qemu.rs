@@ -1005,9 +1005,7 @@ mod tests {
         PreparedQemuLaunch, PreparedVolume, QemuCommandBuilder, VmConfig,
     };
     use crate::app::image::{Image, ImageInfo};
-    use crate::app::{
-        needs_swtpm, GpuConfig, GpuSpec, Manifest, PortMapping, VmVolume, VmWorkDir,
-    };
+    use crate::app::{needs_swtpm, GpuConfig, GpuSpec, Manifest, PortMapping, VmVolume, VmWorkDir};
     use crate::config::{
         Config, CvmPlatform, NetworkFilterMode, Networking, NetworkingMode, Protocol,
         DEFAULT_CONFIG,
