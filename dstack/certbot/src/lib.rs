@@ -18,7 +18,9 @@
 
 pub use acme_client::AcmeClient;
 pub use bot::{read_pubkey, CertBot, CertBotConfig};
-pub use dns01_client::Dns01Client;
+pub use dns01_client::{
+    resolve_cloudflare_zone, verify_cloudflare_token, CloudflareTokenInfo, Dns01Client,
+};
 pub use workdir::WorkDir;
 
 mod acme_client;

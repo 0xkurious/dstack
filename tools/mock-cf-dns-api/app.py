@@ -12,6 +12,7 @@ Supports the following endpoints used by certbot:
 - DELETE /client/v4/zones/{zone_id}/dns_records/{record_id} - Delete DNS record
 """
 
+import hashlib
 import json
 import os
 import uuid
@@ -447,6 +448,66 @@ def get_zone(zone_id):
     resp = cf_response(zone)
     log_request(zone_id, "GET", f"/zones/{zone_id}", None, resp, 200)
 
+    return jsonify(resp), 200
+
+
+# ==================== Token Endpoints ====================
+
+# Simulated token status / permission grants, configurable for failure testing.
+# Example: MOCK_TOKEN_STATUS=expired MOCK_TOKEN_PERMISSIONS="Zone Read"
+MOCK_TOKEN_STATUS = os.environ.get("MOCK_TOKEN_STATUS", "active")
+MOCK_TOKEN_PERMISSIONS = os.environ.get("MOCK_TOKEN_PERMISSIONS", "Zone Read,DNS Write")
+
+
+def token_id_for(token):
+    """Derive a deterministic Cloudflare-style token ID from the bearer token."""
+    return hashlib.sha1(token.encode()).hexdigest()[:32]
+
+
+@app.route("/client/v4/user/tokens/verify", methods=["GET"])
+@verify_auth
+def verify_token():
+    """Verify the API token (status only)."""
+    token = request.headers.get("Authorization", "")[7:]
+    result = {
+        "id": token_id_for(token),
+        "status": MOCK_TOKEN_STATUS,
+        "not_before": None,
+        "expires_on": None,
+    }
+    resp = cf_response(result)
+    log_request("*", "GET", "/user/tokens/verify", None, resp, 200)
+    return jsonify(resp), 200
+
+
+@app.route("/client/v4/user/tokens/<token_id>", methods=["GET"])
+@verify_auth
+def get_token_details(token_id):
+    """Get token details (name, status, permission groups)."""
+    groups = [g.strip() for g in MOCK_TOKEN_PERMISSIONS.split(",") if g.strip()]
+    result = {
+        "id": token_id,
+        "name": "mock-token",
+        "status": MOCK_TOKEN_STATUS,
+        "issued_on": "2024-01-01T00:00:00.000000Z",
+        "modified_on": get_current_time(),
+        "last_used_on": get_current_time(),
+        "not_before": None,
+        "expires_on": None,
+        "policies": [
+            {
+                "id": "mock-policy-0",
+                "effect": "allow",
+                "resources": {"com.cloudflare.api.account.zone.*": "*"},
+                "permission_groups": [
+                    {"id": f"mock-pg-{i}", "name": name}
+                    for i, name in enumerate(groups)
+                ],
+            }
+        ],
+    }
+    resp = cf_response(result)
+    log_request("*", "GET", f"/user/tokens/{token_id}", None, resp, 200)
     return jsonify(resp), 200
 
 
