@@ -602,11 +602,12 @@ impl AdminRpc for AdminRpcHandler {
     async fn list_zt_domains(self) -> Result<ListZtDomainsResponse> {
         let kv_store = self.state.kv_store();
         let cert_resolver = &self.state.cert_resolver;
+        let certbot = &self.state.certbot;
 
         let domains = kv_store
             .list_zt_domain_configs()
             .into_iter()
-            .map(|config| zt_domain_to_proto(config, kv_store, cert_resolver))
+            .map(|config| zt_domain_to_proto(config, kv_store, cert_resolver, certbot))
             .collect();
 
         Ok(ListZtDomainsResponse { domains })
@@ -621,7 +622,12 @@ impl AdminRpc for AdminRpcHandler {
             .get_zt_domain_config(&domain)
             .context("ZT-Domain config not found")?;
 
-        Ok(zt_domain_to_proto(config, kv_store, cert_resolver))
+        Ok(zt_domain_to_proto(
+            config,
+            kv_store,
+            cert_resolver,
+            &self.state.certbot,
+        ))
     }
 
     async fn add_zt_domain(self, request: ProtoZtDomainConfig) -> Result<ZtDomainInfo> {
@@ -639,7 +645,12 @@ impl AdminRpc for AdminRpcHandler {
         kv_store.save_zt_domain_config(&config)?;
         info!("Added ZT-Domain config: {}", config.domain);
 
-        Ok(zt_domain_to_proto(config, kv_store, cert_resolver))
+        Ok(zt_domain_to_proto(
+            config,
+            kv_store,
+            cert_resolver,
+            &self.state.certbot,
+        ))
     }
 
     async fn update_zt_domain(self, request: ProtoZtDomainConfig) -> Result<ZtDomainInfo> {
@@ -656,7 +667,12 @@ impl AdminRpc for AdminRpcHandler {
         kv_store.save_zt_domain_config(&config)?;
         info!("Updated ZT-Domain config: {}", config.domain);
 
-        Ok(zt_domain_to_proto(config, kv_store, cert_resolver))
+        Ok(zt_domain_to_proto(
+            config,
+            kv_store,
+            cert_resolver,
+            &self.state.certbot,
+        ))
     }
 
     async fn delete_zt_domain(self, request: DeleteZtDomainRequest) -> Result<()> {
@@ -1024,10 +1040,12 @@ fn zt_domain_to_proto(
     config: ZtDomainConfig,
     kv_store: &crate::kv::KvStore,
     cert_resolver: &crate::cert_store::CertResolver,
+    certbot: &crate::distributed_certbot::DistributedCertBot,
 ) -> ZtDomainInfo {
     // Get certificate data for status
     let cert_data = kv_store.get_cert_data(&config.domain);
     let loaded_in_memory = cert_resolver.has_cert(&config.domain);
+    let attempt = certbot.attempt_status(&config.domain);
 
     let cert_status = Some(ZtDomainCertStatus {
         has_cert: cert_data.is_some(),
@@ -1035,6 +1053,14 @@ fn zt_domain_to_proto(
         issued_by: cert_data.as_ref().map(|d| d.issued_by).unwrap_or(0),
         issued_at: cert_data.as_ref().map(|d| d.issued_at).unwrap_or(0),
         loaded_in_memory,
+        last_attempt_at: attempt.as_ref().map(|a| a.last_attempt_at).unwrap_or(0),
+        attempted_by: attempt.as_ref().map(|a| a.attempted_by).unwrap_or(0),
+        last_success_at: attempt.as_ref().map(|a| a.last_success_at).unwrap_or(0),
+        consecutive_failures: attempt
+            .as_ref()
+            .map(|a| a.consecutive_failures)
+            .unwrap_or(0),
+        last_error: attempt.map(|a| a.last_error).unwrap_or_default(),
     });
 
     ZtDomainInfo {
