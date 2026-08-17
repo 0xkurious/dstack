@@ -494,7 +494,7 @@ mod transport_tests {
             }
         });
 
-        format!("https://127.0.0.1:{}/wavekv/sync2/persistent", addr.port())
+        format!("https://127.0.0.1:{}/wavekv/sync/persistent", addr.port())
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
