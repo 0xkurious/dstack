@@ -159,6 +159,30 @@ pub struct HttpsClient {
 }
 
 impl HttpsClient {
+    async fn post_gzipped(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&body)
+            .context("failed to compress request")?;
+        let compressed = encoder.finish().context("failed to finish compression")?;
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(url)
+            .header("content-type", "application/x-msgpack-gz")
+            .body(Full::new(Bytes::from(compressed)))
+            .context("failed to build request")?;
+
+        self.client
+            .request(request)
+            .await
+            .with_context(|| format!("failed to send request to {url}"))
+    }
+
     /// Create a new HTTPS client with mTLS configuration
     pub fn new(tls: &HttpsClientConfig) -> Result<Self> {
         // Load client certificate and key
@@ -250,24 +274,7 @@ impl HttpsClient {
     /// not been upgraded yet" from "the request failed", which is the basis of the
     /// wavekv v1/v2 protocol negotiation.
     pub async fn post_bytes_probe(&self, url: &str, body: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder
-            .write_all(&body)
-            .context("failed to compress request")?;
-        let compressed = encoder.finish().context("failed to finish compression")?;
-
-        let request = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(url)
-            .header("content-type", "application/x-msgpack-gz")
-            .body(Full::new(Bytes::from(compressed)))
-            .context("failed to build request")?;
-
-        let response = self
-            .client
-            .request(request)
-            .await
-            .with_context(|| format!("failed to send request to {url}"))?;
+        let response = self.post_gzipped(url, body).await?;
 
         let status = response.status();
         if status == hyper::StatusCode::NOT_FOUND || status == hyper::StatusCode::METHOD_NOT_ALLOWED
@@ -283,6 +290,15 @@ impl HttpsClient {
             &body,
             crate::kv::MAX_DECOMPRESSED_SYNC_BYTES,
         )?))
+    }
+
+    /// Send an already-encoded body to an endpoint whose successful response has no body.
+    pub async fn post_bytes_no_response(&self, url: &str, body: Vec<u8>) -> Result<()> {
+        let response = self.post_gzipped(url, body).await?;
+        if !response.status().is_success() {
+            anyhow::bail!("request failed: {}", response.status());
+        }
+        Ok(())
     }
 
     /// Send a POST request with msgpack + gzip encoded body and receive msgpack + gzip response
@@ -589,6 +605,36 @@ mod transport_tests {
         let payload = b"the-envelope-bytes".to_vec();
         let got = probe(StatusCode::OK, gzip(&payload)).await.unwrap();
         assert_eq!(got, Some(payload));
+    }
+
+    /// Push responses intentionally have no body. A successful delivery must not be
+    /// passed through the sync-response gunzip path.
+    #[tokio::test]
+    async fn an_empty_success_response_is_accepted_for_a_push() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, cert, key) = tls_material(dir.path());
+        let url = serve(StatusCode::OK, Vec::new(), cert, key).await;
+
+        HttpsClient::new(&config)
+            .expect("client")
+            .post_bytes_no_response(&url, b"push-envelope".to_vec())
+            .await
+            .expect("an empty 200 response is a successful push");
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_status_is_rejected() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, cert, key) = tls_material(dir.path());
+        let url = serve(StatusCode::NOT_FOUND, Vec::new(), cert, key).await;
+
+        assert!(HttpsClient::new(&config)
+            .expect("client")
+            .post_bytes_no_response(&url, b"push-envelope".to_vec())
+            .await
+            .is_err());
     }
 
     /// A server certificate carrying an app id, signed by the same test CA.
